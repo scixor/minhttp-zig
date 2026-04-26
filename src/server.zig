@@ -17,13 +17,76 @@ pub const Config = struct {
 pub const InitError = net.IpAddress.ListenError;
 pub const ListenError = net.Server.AcceptError;
 
-/// Returns a `Server` type bound to a comptime-known router. Dispatch is
-/// resolved at compile time
-pub fn Server(comptime router: rtr.Router) type {
-    return ServerImpl(router);
+const ConnError = error{
+    OutOfMemory,
+    ReadFailed,
+    WriteFailed,
+    ParseRequestLine,
+    ParseHeaders,
+    ParseBody,
+    BodyTooLarge,
+} || Io.Cancelable;
+
+fn readRequest(gpa: std.mem.Allocator, read_buf_size: usize, reader: anytype) ConnError!rtr.Request {
+    var needed: usize = 1;
+    var head: []const u8 = undefined;
+    while (true) {
+        // NOTE: (ง •̀_•́)ง unlike what it looks like peekGreedy does one [recv]
+        // 1 is just for peekGreedy to
+        head = reader.interface.peekGreedy(needed) catch |err| switch (err) {
+            error.EndOfStream, error.ReadFailed => return error.ReadFailed,
+        };
+        if (std.mem.indexOf(u8, head, "\r\n\r\n") != null) break;
+        if (head.len == read_buf_size) return error.ParseHeaders;
+        needed = head.len + 1;
+    }
+
+    const line = request.RequestLine.parse(head) catch |err| {
+        std.log.err("RequestLine.parse: {s}", .{@errorName(err)});
+        return error.ParseRequestLine;
+    };
+    var headers = request.RequestHeaders.parse(gpa, head[line.raw.len..]) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.HeaderNoDelimiter => return error.ParseHeaders,
+    };
+    errdefer headers.deinit(gpa);
+
+    const body_len = headers.contentLength() catch return error.ParseBody;
+    const request_len = line.raw.len + headers.raw.len + 4 + body_len;
+    if (request_len > read_buf_size) return error.BodyTooLarge;
+
+    const raw = reader.interface.peekGreedy(request_len) catch |err| switch (err) {
+        error.EndOfStream, error.ReadFailed => return error.ReadFailed,
+    };
+    const body = headers.body(raw, line) catch |err| switch (err) {
+        error.InvalidContentLength, error.BodyIncomplete => return error.ParseBody,
+    };
+    reader.interface.tossBuffered();
+
+    return .{ .line = line, .headers = headers, .body = body };
 }
 
-fn ServerImpl(comptime router: rtr.Router) type {
+fn dispatchRequest(comptime router: rtr.Router, req: *rtr.Request, req_alloc: std.mem.Allocator) rtr.Response {
+    var res = rtr.Response{ .alloc = req_alloc };
+
+    if (router.dispatch(req.line.method, req.line.path)) |handler| {
+        handler(req, &res) catch |err| switch (err) {
+            error.OutOfMemory, error.WriteFailed => {
+                std.log.err("handler: {s}", .{@errorName(err)});
+                return .{ .alloc = req_alloc, .status = 500, .body = "Internal Server Error\n" };
+            },
+        };
+        return res;
+    }
+
+    res.status = 404;
+    res.body = "Not Found\n";
+    return res;
+}
+
+/// Returns a `Server` type bound to a comptime-known router. Dispatch is
+/// resolved at compile time.
+pub fn Server(comptime router: rtr.Router) type {
     return struct {
         const Self = @This();
 
@@ -37,13 +100,7 @@ fn ServerImpl(comptime router: rtr.Router) type {
                 .reuse_address = config.reuse_address,
             });
             errdefer listener.deinit(io);
-
-            return .{
-                .gpa = gpa,
-                .io = io,
-                .config = config,
-                .listener = listener,
-            };
+            return .{ .gpa = gpa, .io = io, .config = config, .listener = listener };
         }
 
         pub fn deinit(self: *Self) void {
@@ -52,7 +109,6 @@ fn ServerImpl(comptime router: rtr.Router) type {
 
         pub fn listen(self: *Self) ListenError!void {
             std.log.info("listening on port {}", .{self.listener.socket.address.getPort()});
-
             var group: Io.Group = .init;
             while (true) {
                 const client = try self.listener.accept(self.io);
@@ -60,17 +116,7 @@ fn ServerImpl(comptime router: rtr.Router) type {
             }
         }
 
-        const ConnError = error{
-            OutOfMemory,
-            ReadFailed,
-            WriteFailed,
-            ParseRequestLine,
-            ParseHeaders,
-            ParseBody,
-            BodyTooLarge,
-        } || Io.Cancelable;
-
-        /// Per-connection thing. Logs and swallows non-cancellation errors
+        /// Per-connection handler. Logs and swallows non-cancellation errors
         /// so they don't tear down the `Io.Group`. Cancellation propagates.
         fn handleClient(self: *Self, client: net.Stream) Io.Cancelable!void {
             defer client.close(self.io);
@@ -78,79 +124,6 @@ fn ServerImpl(comptime router: rtr.Router) type {
                 if (err == error.Canceled) return error.Canceled;
                 std.log.err("connection: {s}", .{@errorName(err)});
             };
-        }
-
-        const ParsedRequest = struct {
-            line: request.RequestLine,
-            headers: request.RequestHeaders,
-            body: []const u8,
-        };
-
-        fn readRequest(self: *Self, reader: anytype) ConnError!ParsedRequest {
-            var needed: usize = 1;
-            var head: []const u8 = undefined;
-            while (true) {
-                // NOTE: (ง •̀_•́)ง unlike what it looks like peekGreedy does one [recv]
-                // 1 is just for peekGreedy to
-                head = reader.interface.peekGreedy(needed) catch |err| switch (err) {
-                    error.EndOfStream, error.ReadFailed => return error.ReadFailed,
-                };
-
-                if (std.mem.indexOf(u8, head, "\r\n\r\n") != null) break;
-                if (head.len == self.config.read_buf_size) return error.ParseHeaders;
-
-                needed = head.len + 1;
-            }
-
-            const line = request.RequestLine.parse(head) catch |err| {
-                std.log.err("RequestLine.parse: {s}", .{@errorName(err)});
-                return error.ParseRequestLine;
-            };
-            var headers = request.RequestHeaders.parse(self.gpa, head[line.raw.len..]) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                error.HeaderNoDelimiter => return error.ParseHeaders,
-            };
-            errdefer headers.deinit(self.gpa);
-
-            const body_len = headers.contentLength() catch return error.ParseBody;
-            const request_len = line.raw.len + headers.raw.len + 4 + body_len;
-            if (request_len > self.config.read_buf_size) return error.BodyTooLarge;
-
-            const raw = reader.interface.peekGreedy(request_len) catch |err| switch (err) {
-                error.EndOfStream, error.ReadFailed => return error.ReadFailed,
-            };
-            const body = headers.body(raw, line) catch |err| switch (err) {
-                error.InvalidContentLength, error.BodyIncomplete => return error.ParseBody,
-            };
-            reader.interface.tossBuffered();
-
-            return .{
-                .line = line,
-                .headers = headers,
-                .body = body,
-            };
-        }
-
-        fn dispatchRequest(req: *rtr.Request, req_alloc: std.mem.Allocator) rtr.Response {
-            var res = rtr.Response{ .alloc = req_alloc };
-
-            if (router.dispatch(req.line.method, req.line.path)) |handler| {
-                handler(req, &res) catch |err| switch (err) {
-                    error.OutOfMemory, error.WriteFailed => {
-                        std.log.err("handler: {s}", .{@errorName(err)});
-                        return .{
-                            .alloc = req_alloc,
-                            .status = 500,
-                            .body = "Internal Server Error\n",
-                        };
-                    },
-                };
-                return res;
-            }
-
-            res.status = 404;
-            res.body = "Not Found\n";
-            return res;
         }
 
         fn handleClientInner(self: *Self, client: net.Stream) ConnError!void {
@@ -166,15 +139,10 @@ fn ServerImpl(comptime router: rtr.Router) type {
             var reader = client.reader(self.io, read_buf);
             var writer = client.writer(self.io, write_buf);
 
-            var parsed = try readRequest(self, &reader);
-            defer parsed.headers.deinit(self.gpa);
+            var req = try readRequest(self.gpa, self.config.read_buf_size, &reader);
+            defer req.headers.deinit(self.gpa);
 
-            var req = rtr.Request{
-                .line = parsed.line,
-                .headers = parsed.headers,
-                .body = parsed.body,
-            };
-            const res = dispatchRequest(&req, req_alloc);
+            const res = dispatchRequest(router, &req, req_alloc);
             try rtr.writeResponse(&writer.interface, res);
             try writer.interface.flush();
         }

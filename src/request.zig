@@ -1,5 +1,4 @@
 const std = @import("std");
-const Io = std.Io;
 const testing = std.testing;
 
 pub const REQ_METHOD = enum(u8) {
@@ -27,6 +26,10 @@ pub const REQ_METHOD = enum(u8) {
         break :blk names;
     };
 
+    pub fn toSlice(method: REQ_METHOD, comptime lower: bool) []const u8 {
+        return if (lower) lower_names[@intFromEnum(method)] else @tagName(method);
+    }
+
     pub fn fromSlice(slice: []const u8) ?REQ_METHOD {
         inline for (@typeInfo(REQ_METHOD).@"enum".fields) |field| {
             if (std.ascii.eqlIgnoreCase(slice, comptime field.name)) {
@@ -34,10 +37,6 @@ pub const REQ_METHOD = enum(u8) {
             }
         }
         return null;
-    }
-
-    pub fn toSlice(method: REQ_METHOD, comptime lower: bool) []const u8 {
-        return if (lower) lower_names[@intFromEnum(method)] else @tagName(method);
     }
 };
 
