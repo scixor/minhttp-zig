@@ -70,10 +70,7 @@ fn readRequest(alloc: std.mem.Allocator, read_buf_size: usize, reader: anytype) 
         needed = head.len + 1;
     }
 
-    const line = request.RequestLine.parse(head) catch |err| {
-        std.log.err("RequestLine.parse: {s}", .{@errorName(err)});
-        return error.ParseRequestLine;
-    };
+    const line = request.RequestLine.parse(head) catch return error.ParseRequestLine;
     var headers = request.RequestHeaders.parse(alloc, head[line.raw.len..]) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.HeaderNoDelimiter => return error.ParseHeaders,
@@ -170,7 +167,15 @@ pub const Server = struct {
         var writer = client.writer(self.io, write_buf);
 
         while (true) {
-            var req = try readRequest(alloc, self.config.read_buf_size, &reader);
+            var req = readRequest(alloc, self.config.read_buf_size, &reader) catch |err| switch (err) {
+                error.ParseRequestLine, error.ParseHeaders, error.ParseBody, error.BodyTooLarge => {
+                    const bad_req: rtr.Response = .{ .alloc = arena_state.allocator(), .status = 400, .body = "Bad Request\n" };
+                    rtr.writeResponse(&writer.interface, bad_req, false) catch {};
+                    writer.interface.flush() catch {};
+                    return;
+                },
+                else => |e| return e,
+            };
             defer req.headers.deinit(alloc);
 
             const keep_alive = shouldKeepAlive(&req);
@@ -262,4 +267,28 @@ test "waitForData - returns Timeout when no data arrives" {
 
     const timeout: Io.Timeout = .{ .duration = .{ .raw = Io.Duration.fromMilliseconds(10), .clock = .awake } };
     try std.testing.expectError(error.Timeout, waitForData(std.testing.io, &reader, timeout));
+}
+
+test "malformed request gets 400 response" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+
+    const addr = try net.Ip4Address.parse("127.0.0.1", 0);
+    var server = try Server.init(io, .{ .address = .{ .ip4 = addr } });
+    defer server.deinit(alloc);
+
+    const pair = try TestSocketPair.init();
+    defer pair.deinit();
+
+    pair.write("GARBAGE REQUEST\r\n\r\n");
+
+    const dummy_addr: net.IpAddress = .{ .ip4 = .{ .bytes = .{ 0, 0, 0, 0 }, .port = 0 } };
+    const client = net.Stream{ .socket = .{ .handle = pair.fds[0], .address = dummy_addr } };
+
+    try Server.handleClientInner(alloc, &server, client);
+
+    var resp_buf: [256]u8 = undefined;
+    const rc = std.posix.system.read(pair.fds[1], &resp_buf, resp_buf.len);
+    try std.testing.expect(std.posix.errno(rc) == .SUCCESS);
+    try std.testing.expect(std.mem.startsWith(u8, resp_buf[0..rc], "HTTP/1.1 400"));
 }
