@@ -27,7 +27,7 @@ const ConnError = error{
     BodyTooLarge,
 } || Io.Cancelable;
 
-fn readRequest(gpa: std.mem.Allocator, read_buf_size: usize, reader: anytype) ConnError!rtr.Request {
+fn readRequest(alloc: std.mem.Allocator, read_buf_size: usize, reader: anytype) ConnError!rtr.Request {
     var needed: usize = 1;
     var head: []const u8 = undefined;
     while (true) {
@@ -45,11 +45,11 @@ fn readRequest(gpa: std.mem.Allocator, read_buf_size: usize, reader: anytype) Co
         std.log.err("RequestLine.parse: {s}", .{@errorName(err)});
         return error.ParseRequestLine;
     };
-    var headers = request.RequestHeaders.parse(gpa, head[line.raw.len..]) catch |err| switch (err) {
+    var headers = request.RequestHeaders.parse(alloc, head[line.raw.len..]) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.HeaderNoDelimiter => return error.ParseHeaders,
     };
-    errdefer headers.deinit(gpa);
+    errdefer headers.deinit(alloc);
 
     const body_len = headers.contentLength() catch return error.ParseBody;
     const request_len = line.raw.len + headers.raw.len + 4 + body_len;
@@ -66,7 +66,7 @@ fn readRequest(gpa: std.mem.Allocator, read_buf_size: usize, reader: anytype) Co
     return .{ .line = line, .headers = headers, .body = body };
 }
 
-fn dispatchRequest(comptime router: rtr.Router, req: *rtr.Request, req_alloc: std.mem.Allocator) rtr.Response {
+fn dispatchRequest(router: *const rtr.Router, req: *rtr.Request, req_alloc: std.mem.Allocator) rtr.Response {
     var res = rtr.Response{ .alloc = req_alloc };
 
     if (router.dispatch(req.line.method, req.line.path)) |handler| {
@@ -84,67 +84,67 @@ fn dispatchRequest(comptime router: rtr.Router, req: *rtr.Request, req_alloc: st
     return res;
 }
 
-/// Returns a `Server` type bound to a comptime-known router. Dispatch is
-/// resolved at compile time.
-pub fn Server(comptime router: rtr.Router) type {
-    return struct {
-        const Self = @This();
+pub const Server = struct {
+    io: Io,
+    config: Config,
+    listener: net.Server,
+    router: rtr.Router,
 
-        gpa: std.mem.Allocator,
-        io: Io,
-        config: Config,
-        listener: net.Server,
+    pub fn init(io: Io, config: Config) InitError!Server {
+        var listener = try config.address.listen(io, .{
+            .reuse_address = config.reuse_address,
+        });
+        errdefer listener.deinit(io);
+        return .{
+            .io = io,
+            .config = config,
+            .listener = listener,
+            .router = rtr.Router.init(),
+        };
+    }
 
-        pub fn init(gpa: std.mem.Allocator, io: Io, config: Config) InitError!Self {
-            var listener = try config.address.listen(io, .{
-                .reuse_address = config.reuse_address,
-            });
-            errdefer listener.deinit(io);
-            return .{ .gpa = gpa, .io = io, .config = config, .listener = listener };
+    pub fn deinit(self: *Server, alloc: std.mem.Allocator) void {
+        self.listener.deinit(self.io);
+        self.router.deinit(alloc);
+    }
+
+    pub fn listen(self: *Server, alloc: std.mem.Allocator) ListenError!void {
+        std.log.info("listening on port {}", .{self.listener.socket.address.getPort()});
+        var group: Io.Group = .init;
+        while (true) {
+            const client = try self.listener.accept(self.io);
+            group.async(self.io, handleClient, .{ alloc, self, client });
         }
+    }
 
-        pub fn deinit(self: *Self) void {
-            self.listener.deinit(self.io);
-        }
+    /// Per-connection handler. Logs and swallows non-cancellation errors
+    /// so they don't tear down the `Io.Group`. Cancellation propagates.
+    fn handleClient(alloc: std.mem.Allocator, self: *Server, client: net.Stream) Io.Cancelable!void {
+        defer client.close(self.io);
+        handleClientInner(alloc, self, client) catch |err| {
+            if (err == error.Canceled) return error.Canceled;
+            std.log.err("connection: {s}", .{@errorName(err)});
+        };
+    }
 
-        pub fn listen(self: *Self) ListenError!void {
-            std.log.info("listening on port {}", .{self.listener.socket.address.getPort()});
-            var group: Io.Group = .init;
-            while (true) {
-                const client = try self.listener.accept(self.io);
-                group.async(self.io, handleClient, .{ self, client });
-            }
-        }
+    fn handleClientInner(alloc: std.mem.Allocator, self: *Server, client: net.Stream) ConnError!void {
+        var arena_state = std.heap.ArenaAllocator.init(alloc);
+        defer arena_state.deinit();
+        const req_alloc = arena_state.allocator();
 
-        /// Per-connection handler. Logs and swallows non-cancellation errors
-        /// so they don't tear down the `Io.Group`. Cancellation propagates.
-        fn handleClient(self: *Self, client: net.Stream) Io.Cancelable!void {
-            defer client.close(self.io);
-            handleClientInner(self, client) catch |err| {
-                if (err == error.Canceled) return error.Canceled;
-                std.log.err("connection: {s}", .{@errorName(err)});
-            };
-        }
+        const read_buf = try alloc.alloc(u8, self.config.read_buf_size);
+        defer alloc.free(read_buf);
+        const write_buf = try alloc.alloc(u8, self.config.write_buf_size);
+        defer alloc.free(write_buf);
 
-        fn handleClientInner(self: *Self, client: net.Stream) ConnError!void {
-            var arena_state = std.heap.ArenaAllocator.init(self.gpa);
-            defer arena_state.deinit();
-            const req_alloc = arena_state.allocator();
+        var reader = client.reader(self.io, read_buf);
+        var writer = client.writer(self.io, write_buf);
 
-            const read_buf = try self.gpa.alloc(u8, self.config.read_buf_size);
-            defer self.gpa.free(read_buf);
-            const write_buf = try self.gpa.alloc(u8, self.config.write_buf_size);
-            defer self.gpa.free(write_buf);
+        var req = try readRequest(alloc, self.config.read_buf_size, &reader);
+        defer req.headers.deinit(alloc);
 
-            var reader = client.reader(self.io, read_buf);
-            var writer = client.writer(self.io, write_buf);
-
-            var req = try readRequest(self.gpa, self.config.read_buf_size, &reader);
-            defer req.headers.deinit(self.gpa);
-
-            const res = dispatchRequest(router, &req, req_alloc);
-            try rtr.writeResponse(&writer.interface, res);
-            try writer.interface.flush();
-        }
-    };
-}
+        const res = dispatchRequest(&self.router, &req, req_alloc);
+        try rtr.writeResponse(&writer.interface, res);
+        try writer.interface.flush();
+    }
+};

@@ -21,26 +21,22 @@ fn handleEcho(req: *rtr.Request, res: *rtr.Response) rtr.HandlerError!void {
     res.content_type = req.headers.map.get("Content-Type") orelse "text/plain";
     res.body = req.body;
 }
-
-const router: rtr.Router = .{
-    .get = &.{
-        .{ .path = "/", .handler = handleIndex },
-    },
-    .post = &.{
-        .{ .path = "/echo", .handler = handleEcho },
-    },
-};
 ```
 
 ```zig
+const alloc = init.gpa;
 const loopback = try std.Io.net.Ip4Address.parse("127.0.0.1", 9865);
 
-var server = try srv.Server(router).init(init.gpa, init.io, .{
+var server = try srv.Server.init(init.io, .{
     .address = .{ .ip4 = loopback },
 });
-defer server.deinit();
+defer server.deinit(alloc);
 
-try server.listen();
+// attach your routes
+try server.router.get(alloc, "/", handleIndex);
+try server.router.post(alloc, "/echo", handleEcho);
+
+try server.listen(alloc);
 ```
 
 Tiny, direct.

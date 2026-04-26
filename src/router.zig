@@ -31,30 +31,62 @@ pub const Route = struct {
 };
 
 pub const Router = struct {
-    get: []const Route = &.{},
-    post: []const Route = &.{},
-    put: []const Route = &.{},
-    delete: []const Route = &.{},
-    patch: []const Route = &.{},
+    get_routes: std.ArrayListUnmanaged(Route),
+    post_routes: std.ArrayListUnmanaged(Route),
+    put_routes: std.ArrayListUnmanaged(Route),
+    delete_routes: std.ArrayListUnmanaged(Route),
+    patch_routes: std.ArrayListUnmanaged(Route),
 
-    pub fn dispatch(
-        self: Router,
-        method: request.REQ_METHOD,
-        path: []const u8,
-    ) ?HandlerFn {
+    pub fn init() Router {
+        return .{
+            .get_routes = .empty,
+            .post_routes = .empty,
+            .put_routes = .empty,
+            .delete_routes = .empty,
+            .patch_routes = .empty,
+        };
+    }
+
+    pub fn deinit(self: *Router, alloc: std.mem.Allocator) void {
+        self.get_routes.deinit(alloc);
+        self.post_routes.deinit(alloc);
+        self.put_routes.deinit(alloc);
+        self.delete_routes.deinit(alloc);
+        self.patch_routes.deinit(alloc);
+    }
+
+    pub fn get(self: *Router, alloc: std.mem.Allocator, path: []const u8, handler: HandlerFn) !void {
+        try self.get_routes.append(alloc, .{ .path = path, .handler = handler });
+    }
+
+    pub fn post(self: *Router, alloc: std.mem.Allocator, path: []const u8, handler: HandlerFn) !void {
+        try self.post_routes.append(alloc, .{ .path = path, .handler = handler });
+    }
+
+    pub fn put(self: *Router, alloc: std.mem.Allocator, path: []const u8, handler: HandlerFn) !void {
+        try self.put_routes.append(alloc, .{ .path = path, .handler = handler });
+    }
+
+    pub fn delete(self: *Router, alloc: std.mem.Allocator, path: []const u8, handler: HandlerFn) !void {
+        try self.delete_routes.append(alloc, .{ .path = path, .handler = handler });
+    }
+
+    pub fn patch(self: *Router, alloc: std.mem.Allocator, path: []const u8, handler: HandlerFn) !void {
+        try self.patch_routes.append(alloc, .{ .path = path, .handler = handler });
+    }
+
+    pub fn dispatch(self: *const Router, method: request.REQ_METHOD, path: []const u8) ?HandlerFn {
         const routes = switch (method) {
-            .GET => self.get,
-            .POST => self.post,
-            .PUT => self.put,
-            .DELETE => self.delete,
-            .PATCH => self.patch,
+            .GET => self.get_routes.items,
+            .POST => self.post_routes.items,
+            .PUT => self.put_routes.items,
+            .DELETE => self.delete_routes.items,
+            .PATCH => self.patch_routes.items,
             else => return null,
         };
 
         for (routes) |route| {
-            if (std.mem.eql(u8, route.path, path)) {
-                return route.handler;
-            }
+            if (std.mem.eql(u8, route.path, path)) return route.handler;
         }
 
         return null;
@@ -97,48 +129,47 @@ const TestHandlers = struct {
 };
 
 test "Router.dispatch - exact match returns handler" {
-    const router: Router = .{
-        .get = &.{
-            .{ .path = "/a", .handler = TestHandlers.a },
-            .{ .path = "/b", .handler = TestHandlers.b },
-        },
-    };
+    var router = Router.init();
+    defer router.deinit(testing.allocator);
+    try router.get(testing.allocator, "/a", TestHandlers.a);
+    try router.get(testing.allocator, "/b", TestHandlers.b);
     try testing.expectEqual(@as(?HandlerFn, TestHandlers.a), router.dispatch(.GET, "/a"));
     try testing.expectEqual(@as(?HandlerFn, TestHandlers.b), router.dispatch(.GET, "/b"));
 }
 
 test "Router.dispatch - unknown path returns null" {
-    const router: Router = .{
-        .get = &.{.{ .path = "/a", .handler = TestHandlers.a }},
-    };
+    var router = Router.init();
+    defer router.deinit(testing.allocator);
+    try router.get(testing.allocator, "/a", TestHandlers.a);
     try testing.expectEqual(@as(?HandlerFn, null), router.dispatch(.GET, "/missing"));
 }
 
 test "Router.dispatch - method mismatch returns null" {
-    const router: Router = .{
-        .get = &.{.{ .path = "/a", .handler = TestHandlers.a }},
-    };
+    var router = Router.init();
+    defer router.deinit(testing.allocator);
+    try router.get(testing.allocator, "/a", TestHandlers.a);
     try testing.expectEqual(@as(?HandlerFn, null), router.dispatch(.POST, "/a"));
 }
 
 test "Router.dispatch - per-method tables are independent" {
-    const router: Router = .{
-        .get = &.{.{ .path = "/x", .handler = TestHandlers.a }},
-        .post = &.{.{ .path = "/x", .handler = TestHandlers.b }},
-    };
+    var router = Router.init();
+    defer router.deinit(testing.allocator);
+    try router.get(testing.allocator, "/x", TestHandlers.a);
+    try router.post(testing.allocator, "/x", TestHandlers.b);
     try testing.expectEqual(@as(?HandlerFn, TestHandlers.a), router.dispatch(.GET, "/x"));
     try testing.expectEqual(@as(?HandlerFn, TestHandlers.b), router.dispatch(.POST, "/x"));
 }
 
 test "Router.dispatch - empty router returns null" {
-    const router: Router = .{};
+    var router = Router.init();
+    defer router.deinit(testing.allocator);
     try testing.expectEqual(@as(?HandlerFn, null), router.dispatch(.GET, "/"));
 }
 
 test "Router.dispatch - unsupported method returns null" {
-    const router: Router = .{
-        .get = &.{.{ .path = "/a", .handler = TestHandlers.a }},
-    };
+    var router = Router.init();
+    defer router.deinit(testing.allocator);
+    try router.get(testing.allocator, "/a", TestHandlers.a);
     try testing.expectEqual(@as(?HandlerFn, null), router.dispatch(.OPTIONS, "/a"));
 }
 
