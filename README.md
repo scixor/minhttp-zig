@@ -6,9 +6,8 @@ This repo is mostly about learning, poking at Zig's IO model, and building up a 
 
 - HTTP/1.1
 - small codebase
-- low ceremony
+- low ceremony (or high depends on the angle)
 - latest-ish Zig
-- still growing :-)
 
 ## little peek
 
