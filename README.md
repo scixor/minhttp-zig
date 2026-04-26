@@ -12,6 +12,8 @@ This repo is mostly about learning, poking at Zig's IO model, and building up a 
 
 ## little peek
 
+handlers:
+
 ```zig
 fn handleIndex(_: *rtr.Request, res: *rtr.Response) rtr.HandlerError!void {
     res.body = "hello\n";
@@ -23,20 +25,27 @@ fn handleEcho(req: *rtr.Request, res: *rtr.Response) rtr.HandlerError!void {
 }
 ```
 
-```zig
-const alloc = init.gpa;
-const loopback = try std.Io.net.Ip4Address.parse("127.0.0.1", 9865);
+server setup:
 
+```zig
 var server = try srv.Server.init(init.io, .{
     .address = .{ .ip4 = loopback },
 });
 defer server.deinit(alloc);
 
-// attach your routes
 try server.router.get(alloc, "/", handleIndex);
 try server.router.post(alloc, "/echo", handleEcho);
 
 try server.listen(alloc);
+```
+
+keep-alive with idle timeout:
+
+```zig
+var server = try srv.Server.init(init.io, .{
+    .address = .{ .ip4 = loopback },
+    .keep_alive_timeout = .{ .duration = .{ .raw = Io.Duration.fromSeconds(30), .clock = .awake } },
+});
 ```
 
 Tiny, direct.

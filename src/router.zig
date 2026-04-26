@@ -95,7 +95,7 @@ pub const Router = struct {
 
 /// Writes a full HTTP/1.1 response to `writer` from the given `Response`.
 /// Content-Length is computed from `res.body.len`.
-pub fn writeResponse(writer: *std.Io.Writer, res: Response) std.Io.Writer.Error!void {
+pub fn writeResponse(writer: *std.Io.Writer, res: Response, keep_alive: bool) std.Io.Writer.Error!void {
     const reason = switch (res.status) {
         200 => "OK",
         201 => "Created",
@@ -112,8 +112,8 @@ pub fn writeResponse(writer: *std.Io.Writer, res: Response) std.Io.Writer.Error!
         else => "Unknown",
     };
     try writer.print(
-        "HTTP/1.1 {d} {s}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n",
-        .{ res.status, reason, res.content_type, res.body.len },
+        "HTTP/1.1 {d} {s}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nConnection: {s}\r\n\r\n",
+        .{ res.status, reason, res.content_type, res.body.len, if (keep_alive) "keep-alive" else "close" },
     );
     try writer.writeAll(res.body);
 }
@@ -180,7 +180,7 @@ test "writeResponse - 200 with body" {
         .alloc = testing.allocator,
         .status = 200,
         .body = "hi",
-    });
+    }, false);
     const expected =
         "HTTP/1.1 200 OK\r\n" ++
         "Content-Type: text/plain\r\n" ++
@@ -197,7 +197,7 @@ test "writeResponse - 404 empty body" {
         .alloc = testing.allocator,
         .status = 404,
         .body = "",
-    });
+    }, false);
     const expected =
         "HTTP/1.1 404 Not Found\r\n" ++
         "Content-Type: text/plain\r\n" ++
@@ -207,6 +207,17 @@ test "writeResponse - 404 empty body" {
     try testing.expectEqualStrings(expected, w.buffered());
 }
 
+test "writeResponse - keep-alive header" {
+    var buf: [256]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try writeResponse(&w, .{
+        .alloc = testing.allocator,
+        .status = 200,
+        .body = "hi",
+    }, true);
+    try testing.expect(std.mem.indexOf(u8, w.buffered(), "Connection: keep-alive\r\n") != null);
+}
+
 test "writeResponse - custom content_type" {
     var buf: [256]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
@@ -214,7 +225,7 @@ test "writeResponse - custom content_type" {
         .alloc = testing.allocator,
         .content_type = "application/json",
         .body = "{}",
-    });
+    }, false);
     try testing.expect(std.mem.indexOf(u8, w.buffered(), "Content-Type: application/json\r\n") != null);
     try testing.expect(std.mem.indexOf(u8, w.buffered(), "Content-Length: 2\r\n") != null);
 }

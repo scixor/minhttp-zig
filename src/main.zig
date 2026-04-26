@@ -4,12 +4,19 @@ const rtr = minhttp.router;
 const srv = minhttp.server;
 
 fn handleIndex(_: *rtr.Request, res: *rtr.Response) rtr.HandlerError!void {
+    std.log.info("/: GET", .{});
     res.body = "hello\n";
 }
 
 fn handleEcho(req: *rtr.Request, res: *rtr.Response) rtr.HandlerError!void {
+    std.log.info("/echo: GET", .{});
     res.content_type = req.headers.map.get("Content-Type") orelse "text/plain";
     res.body = req.body;
+}
+
+fn handlePing(_: *rtr.Request, res: *rtr.Response) rtr.HandlerError!void {
+    std.log.info("/ping: GET", .{});
+    res.body = "pong\n";
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -22,6 +29,7 @@ pub fn main(init: std.process.Init) !void {
     defer server.deinit(alloc);
 
     try server.router.get(alloc, "/", handleIndex);
+    try server.router.get(alloc, "/ping", handlePing);
     try server.router.post(alloc, "/echo", handleEcho);
 
     try server.listen(alloc);
