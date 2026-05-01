@@ -40,7 +40,7 @@ pub const REQ_METHOD = enum(u8) {
     }
 };
 
-pub const ParseRequestLineError = error{ NoMethod, ReqNoDelimiter };
+pub const ParseRequestLineError = error{ NoMethod, ReqNoDelimiter, BadVersion };
 
 pub const RequestLine = struct {
     raw: []const u8,
@@ -48,11 +48,15 @@ pub const RequestLine = struct {
     method: REQ_METHOD,
 
     pub fn parse(buf: []const u8) ParseRequestLineError!RequestLine {
-        const req_line = if (std.mem.indexOf(u8, buf, "\r\n")) |end| buf[0..end] else return ParseRequestLineError.ReqNoDelimiter;
+        const req_line = if (std.mem.find(u8, buf, "\r\n")) |end| buf[0..end] else return ParseRequestLineError.ReqNoDelimiter;
         var parts = std.mem.splitScalar(u8, req_line, ' ');
 
         const method = parts.next() orelse return ParseRequestLineError.NoMethod;
         const path = parts.next() orelse "/";
+        // if not mentioned ¯\_(ツ)_/¯, welp assume its correct one
+        const version = parts.next() orelse "HTTP/1.1";
+
+        if (!std.mem.eql(u8, version, "HTTP/1.1")) return ParseRequestLineError.BadVersion;
 
         const method_type = REQ_METHOD.fromSlice(method) orelse return ParseRequestLineError.NoMethod;
 
@@ -69,14 +73,14 @@ pub const RequestHeaders = struct {
     map: std.StringHashMapUnmanaged([]const u8),
     /// NOTE: Needs to be called after [parseRequestLine] most of the time
     pub fn parse(alloc: std.mem.Allocator, buf: []const u8) ParseHeadersError!RequestHeaders {
-        const end = std.mem.indexOf(u8, buf, "\r\n\r\n") orelse return ParseHeadersError.HeaderNoDelimiter;
+        const end = std.mem.find(u8, buf, "\r\n\r\n") orelse return ParseHeadersError.HeaderNoDelimiter;
 
         var map = std.StringHashMapUnmanaged([]const u8){};
         try map.ensureUnusedCapacity(alloc, 32);
 
         var lines = std.mem.splitSequence(u8, buf[0..end], "\r\n");
         while (lines.next()) |line| {
-            const colon = std.mem.indexOf(u8, line, ":") orelse continue;
+            const colon = std.mem.find(u8, line, ":") orelse continue;
             // parse: `key`:
             const key = line[0..colon];
             // parse: :`[whitespace]value`
@@ -133,11 +137,15 @@ test "RequestLine.parse - case insensitive method" {
 }
 
 test "RequestLine.parse - missing CRLF returns error" {
-    try testing.expectError(error.ReqNoDelimiter, RequestLine.parse("GET /index.html HTTP/1.1"));
+    try testing.expectError(ParseRequestLineError.ReqNoDelimiter, RequestLine.parse("GET /index.html HTTP/1.1"));
 }
 
 test "RequestLine.parse - unknown method throws" {
     try testing.expectError(ParseRequestLineError.NoMethod, RequestLine.parse("BREW /coffee HTTP/1.1\r\n"));
+}
+
+test "RequestLine.parse - throw with incorrect version" {
+    try testing.expectError(ParseRequestLineError.BadVersion, RequestLine.parse("GET /index.html HTTP/2\r\n"));
 }
 
 test "RequestHeaders.parse - single header" {

@@ -1,22 +1,30 @@
 const std = @import("std");
 const minhttp = @import("minhttp");
+const ex = minhttp.exchange;
 const rtr = minhttp.router;
 const srv = minhttp.server;
 
-fn handleIndex(_: *rtr.Request, res: *rtr.Response) rtr.HandlerError!void {
+fn handleIndex(init: ex.Init, _: *ex.Request, res: *ex.Response) rtr.HandlerError!void {
     std.log.info("/: GET", .{});
-    res.body = "hello\n";
+    try res.body_writer.write(init.alloc, "hello\n");
 }
 
-fn handleEcho(req: *rtr.Request, res: *rtr.Response) rtr.HandlerError!void {
-    std.log.info("/echo: GET", .{});
+fn handleEcho(init: ex.Init, req: *ex.Request, res: *ex.Response) rtr.HandlerError!void {
+    std.log.info("/echo: POST", .{});
     res.content_type = req.headers.map.get("Content-Type") orelse "text/plain";
-    res.body = req.body;
+    const body = req.body_reader.readAll(init.alloc, 1024 * 1024) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.BodyTooLarge, error.ReadFailed, error.EndOfStream, error.InvalidChunk => {
+            res.status = 400;
+            return;
+        },
+    };
+    try res.body_writer.write(init.alloc, body);
 }
 
-fn handlePing(_: *rtr.Request, res: *rtr.Response) rtr.HandlerError!void {
+fn handlePing(init: ex.Init, _: *ex.Request, res: *ex.Response) rtr.HandlerError!void {
     std.log.info("/ping: GET", .{});
-    res.body = "pong\n";
+    try res.body_writer.write(init.alloc, "pong\n");
 }
 
 pub fn main(init: std.process.Init) !void {

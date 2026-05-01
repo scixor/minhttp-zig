@@ -3,6 +3,7 @@ const Io = std.Io;
 const net = Io.net;
 
 const request = @import("request.zig");
+const ex = @import("exchange.zig");
 const rtr = @import("router.zig");
 
 pub const Config = struct {
@@ -31,7 +32,7 @@ const ConnError = error{
     PeerClosed,
 } || Io.Cancelable;
 
-fn shouldKeepAlive(req: *const rtr.Request) bool {
+fn shouldKeepAlive(req: *const ex.Request) bool {
     const conn = req.headers.map.get("Connection") orelse return true;
     return !std.ascii.eqlIgnoreCase(conn, "close");
 }
@@ -56,57 +57,62 @@ fn waitForData(io: Io, reader: *net.Stream.Reader, timeout: Io.Timeout) ConnErro
     reader.interface.end = n;
 }
 
-fn readRequest(alloc: std.mem.Allocator, read_buf_size: usize, reader: anytype) ConnError!rtr.Request {
+fn readRequest(alloc: std.mem.Allocator, read_buf_size: usize, reader: *net.Stream.Reader) ConnError!ex.Request {
     var needed: usize = 1;
     var head: []const u8 = undefined;
+    var header_end: usize = undefined;
     while (true) {
         // NOTE: (ง •̀_•́)ง unlike what it looks like peekGreedy does one [recv]
         // 1 is just for peekGreedy to
         head = reader.interface.peekGreedy(needed) catch |err| switch (err) {
             error.EndOfStream, error.ReadFailed => return error.ReadFailed,
         };
-        if (std.mem.indexOf(u8, head, "\r\n\r\n") != null) break;
+        if (std.mem.find(u8, head, "\r\n\r\n")) |pos| { header_end = pos; break; }
         if (head.len == read_buf_size) return error.ParseHeaders;
         needed = head.len + 1;
     }
 
-    const line = request.RequestLine.parse(head) catch return error.ParseRequestLine;
-    var headers = request.RequestHeaders.parse(alloc, head[line.raw.len..]) catch |err| switch (err) {
+    const header_len = header_end + 4;
+    const head_copy = alloc.dupe(u8, head[0..header_len]) catch return error.OutOfMemory;
+    errdefer alloc.free(head_copy);
+
+    const line = request.RequestLine.parse(head_copy) catch return error.ParseRequestLine;
+    var headers = request.RequestHeaders.parse(alloc, head_copy[line.raw.len..]) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.HeaderNoDelimiter => return error.ParseHeaders,
     };
     errdefer headers.deinit(alloc);
 
-    const body_len = headers.contentLength() catch return error.ParseBody;
-    const request_len = line.raw.len + headers.raw.len + 4 + body_len;
-    if (request_len > read_buf_size) return error.BodyTooLarge;
+    reader.interface.toss(header_len);
 
-    const raw = reader.interface.peekGreedy(request_len) catch |err| switch (err) {
-        error.EndOfStream, error.ReadFailed => return error.ReadFailed,
+    const body_reader: ex.BodyReader = body_reader: {
+        if (headers.map.get("Transfer-Encoding")) |te| {
+            if (std.ascii.eqlIgnoreCase(te, "chunked")) break :body_reader ex.BodyReader.chunked(&reader.interface);
+        }
+        const body_len = headers.contentLength() catch return error.ParseBody;
+        break :body_reader if (body_len == 0) ex.BodyReader.empty() else ex.BodyReader.fixed(&reader.interface, body_len);
     };
-    const body = headers.body(raw, line) catch |err| switch (err) {
-        error.InvalidContentLength, error.BodyIncomplete => return error.ParseBody,
-    };
-    reader.interface.tossBuffered();
 
-    return .{ .line = line, .headers = headers, .body = body };
+    return .{ .line = line, .headers = headers, .body_reader = body_reader };
 }
 
-fn dispatchRequest(router: *const rtr.Router, req: *rtr.Request, req_alloc: std.mem.Allocator) rtr.Response {
-    var res = rtr.Response{ .alloc = req_alloc };
+fn dispatchRequest(router: *const rtr.Router, init: ex.Init, req: *ex.Request) ex.Response {
+    var res = ex.Response{};
 
     if (router.dispatch(req.line.method, req.line.path)) |handler| {
-        handler(req, &res) catch |err| switch (err) {
+        handler(init, req, &res) catch |err| switch (err) {
             error.OutOfMemory, error.WriteFailed => {
                 std.log.err("handler: {s}", .{@errorName(err)});
-                return .{ .alloc = req_alloc, .status = 500, .body = "Internal Server Error\n" };
+                var err_res: ex.Response = .{ .status = 500 };
+                err_res.body_writer.write(init.alloc, "Internal Server Error\n") catch {};
+                return err_res;
             },
         };
         return res;
     }
 
     res.status = 404;
-    res.body = "Not Found\n";
+    res.body_writer.write(init.alloc, "Not Found\n") catch {};
     return res;
 }
 
@@ -167,19 +173,30 @@ pub const Server = struct {
         var writer = client.writer(self.io, write_buf);
 
         while (true) {
-            var req = readRequest(alloc, self.config.read_buf_size, &reader) catch |err| switch (err) {
+            const req_alloc = arena_state.allocator();
+            var req = readRequest(req_alloc, self.config.read_buf_size, &reader) catch |err| switch (err) {
                 error.ParseRequestLine, error.ParseHeaders, error.ParseBody, error.BodyTooLarge => {
-                    const bad_req: rtr.Response = .{ .alloc = arena_state.allocator(), .status = 400, .body = "Bad Request\n" };
-                    rtr.writeResponse(&writer.interface, bad_req, false) catch {};
+                    var err_res: ex.Response = .{ .status = 400 };
+                    err_res.body_writer.write(req_alloc, "Bad Request\n") catch {};
+                    rtr.writeResponse(&writer.interface, err_res, false) catch {};
                     writer.interface.flush() catch {};
                     return;
                 },
                 else => |e| return e,
             };
-            defer req.headers.deinit(alloc);
 
+            const hctx: ex.Init = .{ .io = self.io, .alloc = req_alloc };
             const keep_alive = shouldKeepAlive(&req);
-            const res = dispatchRequest(&self.router, &req, arena_state.allocator());
+            const res = dispatchRequest(&self.router, hctx, &req);
+            req.body_reader.discardAll(self.config.read_buf_size) catch |err| switch (err) {
+                error.BodyTooLarge, error.ReadFailed, error.EndOfStream, error.InvalidChunk => {
+                    var err_res: ex.Response = .{ .status = 400 };
+                    err_res.body_writer.write(req_alloc, "Bad Request\n") catch {};
+                    rtr.writeResponse(&writer.interface, err_res, false) catch {};
+                    writer.interface.flush() catch {};
+                    return;
+                },
+            };
             try rtr.writeResponse(&writer.interface, res, keep_alive);
             try writer.interface.flush();
 
@@ -193,28 +210,28 @@ pub const Server = struct {
 test "shouldKeepAlive - no Connection header returns true" {
     var headers = try request.RequestHeaders.parse(std.testing.allocator, "Host: example.com\r\n\r\n");
     defer headers.deinit(std.testing.allocator);
-    const req = rtr.Request{ .line = .{ .raw = "", .path = "/", .method = .GET }, .headers = headers, .body = "" };
+    const req = ex.Request{ .line = .{ .raw = "", .path = "/", .method = .GET }, .headers = headers, .body_reader = ex.BodyReader.empty() };
     try std.testing.expect(shouldKeepAlive(&req));
 }
 
 test "shouldKeepAlive - Connection: close returns false" {
     var headers = try request.RequestHeaders.parse(std.testing.allocator, "Connection: close\r\n\r\n");
     defer headers.deinit(std.testing.allocator);
-    const req = rtr.Request{ .line = .{ .raw = "", .path = "/", .method = .GET }, .headers = headers, .body = "" };
+    const req = ex.Request{ .line = .{ .raw = "", .path = "/", .method = .GET }, .headers = headers, .body_reader = ex.BodyReader.empty() };
     try std.testing.expect(!shouldKeepAlive(&req));
 }
 
 test "shouldKeepAlive - Connection: keep-alive returns true" {
     var headers = try request.RequestHeaders.parse(std.testing.allocator, "Connection: keep-alive\r\n\r\n");
     defer headers.deinit(std.testing.allocator);
-    const req = rtr.Request{ .line = .{ .raw = "", .path = "/", .method = .GET }, .headers = headers, .body = "" };
+    const req = ex.Request{ .line = .{ .raw = "", .path = "/", .method = .GET }, .headers = headers, .body_reader = ex.BodyReader.empty() };
     try std.testing.expect(shouldKeepAlive(&req));
 }
 
 test "shouldKeepAlive - case insensitive" {
     var headers = try request.RequestHeaders.parse(std.testing.allocator, "Connection: Close\r\n\r\n");
     defer headers.deinit(std.testing.allocator);
-    const req = rtr.Request{ .line = .{ .raw = "", .path = "/", .method = .GET }, .headers = headers, .body = "" };
+    const req = ex.Request{ .line = .{ .raw = "", .path = "/", .method = .GET }, .headers = headers, .body_reader = ex.BodyReader.empty() };
     try std.testing.expect(!shouldKeepAlive(&req));
 }
 
@@ -241,6 +258,21 @@ const TestSocketPair = struct {
 
     fn write(self: TestSocketPair, data: []const u8) void {
         _ = std.posix.system.write(self.fds[1], data.ptr, data.len);
+    }
+};
+
+const TestHandlers = struct {
+    fn echoChunkedByRead(init: ex.Init, req: *ex.Request, res: *ex.Response) rtr.HandlerError!void {
+        var buf: [3]u8 = undefined;
+        while (true) {
+            const n = req.body_reader.read(&buf) catch |err| {
+                res.status = 400;
+                res.body_writer.write(init.alloc, @errorName(err)) catch {};
+                return;
+            };
+            if (n == 0) break;
+            try res.body_writer.write(init.alloc, buf[0..n]);
+        }
     }
 };
 
@@ -291,4 +323,41 @@ test "malformed request gets 400 response" {
     const rc = std.posix.system.read(pair.fds[1], &resp_buf, resp_buf.len);
     try std.testing.expect(std.posix.errno(rc) == .SUCCESS);
     try std.testing.expect(std.mem.startsWith(u8, resp_buf[0..rc], "HTTP/1.1 400"));
+}
+
+test "chunked request body can be read incrementally by handler" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+
+    const addr = try net.Ip4Address.parse("127.0.0.1", 0);
+    var server = try Server.init(io, .{ .address = .{ .ip4 = addr } });
+    defer server.deinit(alloc);
+    try server.router.post(alloc, "/echo", TestHandlers.echoChunkedByRead);
+
+    const pair = try TestSocketPair.init();
+    defer pair.deinit();
+
+    pair.write(
+        "POST /echo HTTP/1.1\r\n" ++
+            "Host: example.com\r\n" ++
+            "Transfer-Encoding: chunked\r\n" ++
+            "Connection: close\r\n" ++
+            "\r\n" ++
+            "4\r\nWiki\r\n" ++
+            "5\r\npedia\r\n" ++
+            "0\r\n\r\n",
+    );
+
+    const dummy_addr: net.IpAddress = .{ .ip4 = .{ .bytes = .{ 0, 0, 0, 0 }, .port = 0 } };
+    const client = net.Stream{ .socket = .{ .handle = pair.fds[0], .address = dummy_addr } };
+
+    try Server.handleClientInner(alloc, &server, client);
+
+    var resp_buf: [512]u8 = undefined;
+    const rc = std.posix.system.read(pair.fds[1], &resp_buf, resp_buf.len);
+    try std.testing.expect(std.posix.errno(rc) == .SUCCESS);
+    const resp = resp_buf[0..rc];
+    try std.testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 200"));
+    try std.testing.expect(std.mem.find(u8, resp, "Content-Length: 9\r\n") != null);
+    try std.testing.expect(std.mem.endsWith(u8, resp, "\r\n\r\nWikipedia"));
 }

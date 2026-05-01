@@ -1,29 +1,17 @@
 const std = @import("std");
 const testing = std.testing;
 const request = @import("request.zig");
+const ex = @import("exchange.zig");
 
 /// Errors a handler is allowed to return. Keep this tight -- anything broader
-/// should be handled inside the handler. `OutOfMemory` covers `res.alloc`
+/// should be handled inside the handler. `OutOfMemory` covers `init.alloc`
 /// failures; `WriteFailed` is reserved for handlers that stream directly.
 pub const HandlerError = error{
     OutOfMemory,
     WriteFailed,
 };
 
-pub const Request = struct {
-    line: request.RequestLine,
-    headers: request.RequestHeaders,
-    body: []const u8,
-};
-
-pub const Response = struct {
-    status: u16 = 200,
-    content_type: []const u8 = "text/plain",
-    body: []const u8 = "",
-    alloc: std.mem.Allocator,
-};
-
-pub const HandlerFn = *const fn (req: *Request, res: *Response) HandlerError!void;
+pub const HandlerFn = *const fn (init: ex.Init, req: *ex.Request, res: *ex.Response) HandlerError!void;
 
 pub const Route = struct {
     path: []const u8,
@@ -94,8 +82,7 @@ pub const Router = struct {
 };
 
 /// Writes a full HTTP/1.1 response to `writer` from the given `Response`.
-/// Content-Length is computed from `res.body.len`.
-pub fn writeResponse(writer: *std.Io.Writer, res: Response, keep_alive: bool) std.Io.Writer.Error!void {
+pub fn writeResponse(writer: *std.Io.Writer, res: ex.Response, keep_alive: bool) std.Io.Writer.Error!void {
     const reason = switch (res.status) {
         200 => "OK",
         201 => "Created",
@@ -111,20 +98,37 @@ pub fn writeResponse(writer: *std.Io.Writer, res: Response, keep_alive: bool) st
         500 => "Internal Server Error",
         else => "Unknown",
     };
-    try writer.print(
-        "HTTP/1.1 {d} {s}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nConnection: {s}\r\n\r\n",
-        .{ res.status, reason, res.content_type, res.body.len, if (keep_alive) "keep-alive" else "close" },
-    );
-    try writer.writeAll(res.body);
+    const conn = if (keep_alive) "keep-alive" else "close";
+    switch (res.body_writer.impl) {
+        .fixed => |fw| {
+            try writer.print(
+                "HTTP/1.1 {d} {s}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nConnection: {s}\r\n\r\n",
+                .{ res.status, reason, res.content_type, fw.buf.items.len, conn },
+            );
+            try writer.writeAll(fw.buf.items);
+        },
+        .chunked => |cw| {
+            try writer.print(
+                "HTTP/1.1 {d} {s}\r\nContent-Type: {s}\r\nTransfer-Encoding: chunked\r\nConnection: {s}\r\n\r\n",
+                .{ res.status, reason, res.content_type, conn },
+            );
+            for (cw.chunks.items) |c| {
+                try writer.print("{x}\r\n", .{c.len});
+                try writer.writeAll(c);
+                try writer.writeAll("\r\n");
+            }
+            try writer.writeAll("0\r\n\r\n");
+        },
+    }
 }
 
 const TestHandlers = struct {
-    fn a(_: *Request, res: *Response) HandlerError!void {
-        res.body = "A";
+    fn a(init: ex.Init, _: *ex.Request, res: *ex.Response) HandlerError!void {
+        try res.body_writer.write(init.alloc, "A");
     }
 
-    fn b(_: *Request, res: *Response) HandlerError!void {
-        res.body = "B";
+    fn b(init: ex.Init, _: *ex.Request, res: *ex.Response) HandlerError!void {
+        try res.body_writer.write(init.alloc, "B");
     }
 };
 
@@ -176,11 +180,10 @@ test "Router.dispatch - unsupported method returns null" {
 test "writeResponse - 200 with body" {
     var buf: [256]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
-    try writeResponse(&w, .{
-        .alloc = testing.allocator,
-        .status = 200,
-        .body = "hi",
-    }, false);
+    var res: ex.Response = .{ .status = 200 };
+    defer res.body_writer.deinit(testing.allocator);
+    try res.body_writer.write(testing.allocator, "hi");
+    try writeResponse(&w, res, false);
     const expected =
         "HTTP/1.1 200 OK\r\n" ++
         "Content-Type: text/plain\r\n" ++
@@ -193,11 +196,9 @@ test "writeResponse - 200 with body" {
 test "writeResponse - 404 empty body" {
     var buf: [256]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
-    try writeResponse(&w, .{
-        .alloc = testing.allocator,
-        .status = 404,
-        .body = "",
-    }, false);
+    var res: ex.Response = .{ .status = 404 };
+    defer res.body_writer.deinit(testing.allocator);
+    try writeResponse(&w, res, false);
     const expected =
         "HTTP/1.1 404 Not Found\r\n" ++
         "Content-Type: text/plain\r\n" ++
@@ -210,22 +211,35 @@ test "writeResponse - 404 empty body" {
 test "writeResponse - keep-alive header" {
     var buf: [256]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
-    try writeResponse(&w, .{
-        .alloc = testing.allocator,
-        .status = 200,
-        .body = "hi",
-    }, true);
-    try testing.expect(std.mem.indexOf(u8, w.buffered(), "Connection: keep-alive\r\n") != null);
+    var res: ex.Response = .{ .status = 200 };
+    defer res.body_writer.deinit(testing.allocator);
+    try res.body_writer.write(testing.allocator, "hi");
+    try writeResponse(&w, res, true);
+    try testing.expect(std.mem.find(u8, w.buffered(), "Connection: keep-alive\r\n") != null);
 }
 
 test "writeResponse - custom content_type" {
     var buf: [256]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
-    try writeResponse(&w, .{
-        .alloc = testing.allocator,
-        .content_type = "application/json",
-        .body = "{}",
-    }, false);
-    try testing.expect(std.mem.indexOf(u8, w.buffered(), "Content-Type: application/json\r\n") != null);
-    try testing.expect(std.mem.indexOf(u8, w.buffered(), "Content-Length: 2\r\n") != null);
+    var res: ex.Response = .{ .content_type = "application/json" };
+    defer res.body_writer.deinit(testing.allocator);
+    try res.body_writer.write(testing.allocator, "{}");
+    try writeResponse(&w, res, false);
+    try testing.expect(std.mem.find(u8, w.buffered(), "Content-Type: application/json\r\n") != null);
+    try testing.expect(std.mem.find(u8, w.buffered(), "Content-Length: 2\r\n") != null);
+}
+
+test "writeResponse - chunked body_writer" {
+    var buf: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var res: ex.Response = .{};
+    defer res.body_writer.deinit(testing.allocator);
+    try res.body_writer.chunk(testing.allocator, "Wiki");
+    try res.body_writer.chunk(testing.allocator, "pedia");
+    try writeResponse(&w, res, false);
+    const out = w.buffered();
+    try testing.expect(std.mem.find(u8, out, "Transfer-Encoding: chunked\r\n") != null);
+    try testing.expect(std.mem.find(u8, out, "4\r\nWiki\r\n") != null);
+    try testing.expect(std.mem.find(u8, out, "5\r\npedia\r\n") != null);
+    try testing.expectEqualStrings("0\r\n\r\n", out[out.len - 5 ..]);
 }
