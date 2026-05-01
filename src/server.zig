@@ -67,7 +67,10 @@ fn readRequest(alloc: std.mem.Allocator, read_buf_size: usize, reader: *net.Stre
         head = reader.interface.peekGreedy(needed) catch |err| switch (err) {
             error.EndOfStream, error.ReadFailed => return error.ReadFailed,
         };
-        if (std.mem.find(u8, head, "\r\n\r\n")) |pos| { header_end = pos; break; }
+        if (std.mem.find(u8, head, "\r\n\r\n")) |pos| {
+            header_end = pos;
+            break;
+        }
         if (head.len == read_buf_size) return error.ParseHeaders;
         needed = head.len + 1;
     }
