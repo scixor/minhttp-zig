@@ -14,12 +14,12 @@ pub const REQ_METHOD = enum(u8) {
     _,
 
     pub const lower_names = blk: {
-        const fields = @typeInfo(REQ_METHOD).@"enum".fields;
-        var names: [fields.len][]const u8 = undefined;
+        const info = @typeInfo(REQ_METHOD).@"enum";
+        var names: [info.field_names.len][]const u8 = undefined;
 
-        for (fields, 0..) |field, i| {
-            var buf: [field.name.len]u8 = undefined;
-            _ = std.ascii.lowerString(&buf, field.name);
+        for (info.field_names, 0..) |name, i| {
+            var buf: [name.len]u8 = undefined;
+            _ = std.ascii.lowerString(&buf, name);
             names[i] = buf[0..];
         }
 
@@ -31,9 +31,10 @@ pub const REQ_METHOD = enum(u8) {
     }
 
     pub fn fromSlice(slice: []const u8) ?REQ_METHOD {
-        inline for (@typeInfo(REQ_METHOD).@"enum".fields) |field| {
-            if (std.ascii.eqlIgnoreCase(slice, comptime field.name)) {
-                return @enumFromInt(field.value);
+        const info = @typeInfo(REQ_METHOD).@"enum";
+        inline for (info.field_names, info.field_values) |name, value| {
+            if (std.ascii.eqlIgnoreCase(slice, comptime name)) {
+                return @enumFromInt(value);
             }
         }
         return null;
