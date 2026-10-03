@@ -51,7 +51,7 @@ fn waitForData(io: Io, reader: *net.Stream.Reader, timeout: Io.Timeout) ConnErro
         error.Canceled => return error.Canceled,
         error.ConcurrencyUnavailable => return error.ReadFailed,
     };
-    const n = op_result.net_read catch return error.ReadFailed;
+    const n = (op_result.net_read catch return error.ReadFailed).data_len;
     if (n == 0) return error.PeerClosed;
     reader.interface.seek = 0;
     reader.interface.end = n;

@@ -3,7 +3,7 @@
     .version = "0.0.0",
 
     .fingerprint = 0xc8c8b74b8e100174,
-    .minimum_zig_version = "0.17.0-dev.1099+7db2ef610",
+    .minimum_zig_version = "0.17.0-dev.1456+2b1c6633a",
     .dependencies = .{},
     .paths = .{
         "build.zig",
