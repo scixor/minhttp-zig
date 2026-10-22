@@ -65,7 +65,7 @@ zig build check
 ## zig
 
 ```text
-0.17.0-dev.1456+2b1c6633a
+0.18.0-dev.367+187d0bf9e
 ```
 
 More to come c[_]

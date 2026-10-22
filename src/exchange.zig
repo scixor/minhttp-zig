@@ -158,7 +158,7 @@ pub const BodyReader = struct {
 
 // Writers
 pub const FixedWriter = struct {
-    buf: std.ArrayListUnmanaged(u8) = .empty,
+    buf: std.ArrayList(u8) = .empty,
 
     fn deinit(self: *FixedWriter, alloc: std.mem.Allocator) void {
         self.buf.deinit(alloc);
@@ -166,7 +166,7 @@ pub const FixedWriter = struct {
 };
 
 const ChunkedWriter = struct {
-    chunks: std.ArrayListUnmanaged([]const u8) = .empty,
+    chunks: std.ArrayList([]const u8) = .empty,
 
     fn deinit(self: *ChunkedWriter, alloc: std.mem.Allocator) void {
         for (self.chunks.items) |c| alloc.free(c);

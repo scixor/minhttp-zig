@@ -19,11 +19,11 @@ pub const Route = struct {
 };
 
 pub const Router = struct {
-    get_routes: std.ArrayListUnmanaged(Route),
-    post_routes: std.ArrayListUnmanaged(Route),
-    put_routes: std.ArrayListUnmanaged(Route),
-    delete_routes: std.ArrayListUnmanaged(Route),
-    patch_routes: std.ArrayListUnmanaged(Route),
+    get_routes: std.ArrayList(Route),
+    post_routes: std.ArrayList(Route),
+    put_routes: std.ArrayList(Route),
+    delete_routes: std.ArrayList(Route),
+    patch_routes: std.ArrayList(Route),
 
     pub fn init() Router {
         return .{
